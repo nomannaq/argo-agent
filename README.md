@@ -1,6 +1,6 @@
 # Argo
 
-![Argo Demo](docs/assets/argo-demo.gif) *(Self-correction: I will need to add this image later, or explain that it's a placeholder.)*
+
 
 **Argo** is a powerful, terminal-based AI coding agent written in Go, designed to bring the capabilities of large language models directly into your development workflow. Interact with an intelligent assistant that can read, write, and modify code within your projects, all from the comfort and speed of your terminal.
 
