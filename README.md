@@ -2,9 +2,7 @@
 
 
 
-**Argo** is a powerful, terminal-based AI coding agent written in Go, designed to bring the capabilities of large language models directly into your development workflow. Interact with an intelligent assistant that can read, write, and modify code within your projects, all from the comfort and speed of your terminal.
-
-Inspired by innovative tools like [Claude Code](https://docs.anthropic.com/en/docs/claude-code) and [Zed Agent](https://zed.dev/blog/zed-ai), Argo focuses on delivering a fast, lightweight, and highly extensible coding agent experience.
+**Argo** is a powerful, terminal-based AI coding agent written in Go, designed to bring the capabilities of large language models directly into your development workflow. Interact with an intelligent assistant that can read, write, and modify code within your projects, all from the comfort and speed of your terminal. Argo aims to be secure out of the box as "Security is the best policy".
 
 ## Getting Started
 
