@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"strconv"
 	"strings"
 
 	"github.com/charmbracelet/bubbles/textarea"
@@ -13,6 +12,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/nomanqureshi/argo/internal/agent"
+	"github.com/nomanqureshi/argo/internal/commands"
 	"github.com/nomanqureshi/argo/internal/llm"
 	"github.com/nomanqureshi/argo/internal/permissions"
 	"github.com/nomanqureshi/argo/internal/prompt"
@@ -75,6 +75,7 @@ type App struct {
 	// Cost tracking
 	totalCost float64
 	modelName string // to track which model for cost calculation
+	provider  string // provider name (e.g. "anthropic")
 
 	permissionPending *permissionInfo
 	permissionCh      chan bool // channel for sending permission responses to the agent
@@ -84,47 +85,11 @@ type App struct {
 
 	threadStore   *agent.SQLiteStore         // for thread persistence
 	policyHandler *permissions.PolicyHandler // for advanced permissions
+	toolReg       *tools.Registry            // tool registry for listing tools
+	cmdRegistry   *commands.Registry         // slash command registry
 }
 
-// estimateCost estimates the cost in USD based on model name and token counts.
-func estimateCost(model string, inputTokens, outputTokens int) float64 {
-	lowerModel := strings.ToLower(model)
 
-	var inputPricePerM, outputPricePerM float64
-
-	switch {
-	case strings.HasPrefix(lowerModel, "claude-sonnet-4") ||
-		strings.HasPrefix(lowerModel, "claude-3.5-sonnet") ||
-		strings.HasPrefix(lowerModel, "claude-3-5-sonnet"):
-		inputPricePerM = 3.0
-		outputPricePerM = 15.0
-	case strings.HasPrefix(lowerModel, "claude-opus-4") ||
-		strings.HasPrefix(lowerModel, "claude-3-opus"):
-		inputPricePerM = 15.0
-		outputPricePerM = 75.0
-	case strings.HasPrefix(lowerModel, "claude-3.5-haiku") ||
-		strings.HasPrefix(lowerModel, "claude-3-5-haiku") ||
-		strings.HasPrefix(lowerModel, "claude-3-haiku"):
-		inputPricePerM = 0.25
-		outputPricePerM = 1.25
-	case strings.HasPrefix(lowerModel, "gpt-4o-mini"):
-		inputPricePerM = 0.15
-		outputPricePerM = 0.60
-	case strings.HasPrefix(lowerModel, "gpt-4o"):
-		inputPricePerM = 2.50
-		outputPricePerM = 10.0
-	case strings.HasPrefix(lowerModel, "gpt-4-turbo"):
-		inputPricePerM = 10.0
-		outputPricePerM = 30.0
-	default:
-		inputPricePerM = 1.0
-		outputPricePerM = 3.0
-	}
-
-	cost := (float64(inputTokens) / 1_000_000.0 * inputPricePerM) +
-		(float64(outputTokens) / 1_000_000.0 * outputPricePerM)
-	return cost
-}
 
 // NewApp creates a new App model suitable for use with tea.NewProgram.
 // It takes a model name and provider name (e.g. "claude-sonnet-4-20250514", "anthropic").
@@ -189,6 +154,10 @@ func NewApp(model, provider string) tea.Model {
 	vp := viewport.New(80, 20)
 	vp.SetContent("Welcome to Argo! 🚀\n\nAn AI coding agent for your terminal.\n\nType a message and press Enter to send.\nType /help for available commands.\nPress Ctrl+C to quit.\n")
 
+	// Create the command registry and register all built-in commands.
+	cmdReg := commands.NewRegistry()
+	commands.RegisterBuiltins(cmdReg)
+
 	app := &App{
 		textarea:      ta,
 		viewport:      vp,
@@ -196,9 +165,12 @@ func NewApp(model, provider string) tea.Model {
 		state:         stateInput,
 		statusMsg:     "Ready",
 		modelName:     model,
+		provider:      provider,
 		permissionCh:  permCh,
 		eventCh:       eventCh,
 		policyHandler: policyHandler,
+		toolReg:       toolReg,
+		cmdRegistry:   cmdReg,
 	}
 
 	if providerErr != nil {
@@ -426,106 +398,37 @@ func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 // handleSlashCommand processes a slash command and returns true if it was handled.
 func (a *App) handleSlashCommand(input string) (tea.Model, tea.Cmd, bool) {
-	parts := strings.Fields(input)
-	if len(parts) == 0 {
-		return a, nil, false
+	cmd, args := a.cmdRegistry.Match(input)
+	if cmd == nil {
+		// No matching command found.
+		parts := strings.Fields(input)
+		if len(parts) > 0 {
+			a.appendToChat(errorStyle.Render(fmt.Sprintf("Unknown command: %s", parts[0])) + "\n")
+			a.appendToChat(dimStyle.Render("Type /help for available commands.") + "\n\n")
+		}
+		return a, nil, true
 	}
 
-	command := strings.ToLower(parts[0])
+	// Build the command context from current app state.
+	var toolNames []string
+	if a.toolReg != nil {
+		toolNames = a.toolReg.ToolNames()
+	}
+	cmdCtx := &commands.Context{
+		Ctx:          context.Background(),
+		Agent:        a.agent,
+		ThreadStore:  a.threadStore,
+		ModelName:    a.modelName,
+		Provider:     a.provider,
+		InputTokens:  a.totalInputTokens,
+		OutputTokens: a.totalOutputTokens,
+		ToolNames:    toolNames,
+	}
 
-	switch command {
-	case "/clear":
-		a.chatHistory = ""
-		a.currentResponse = ""
-		a.totalInputTokens = 0
-		a.totalOutputTokens = 0
-		a.totalCost = 0
-		if a.agent != nil {
-			a.agent.ResetThread()
-		}
-		a.viewport.SetContent("")
-		a.viewport.GotoBottom()
-		a.appendToChat(dimStyle.Render("Chat cleared.") + "\n\n")
-		a.statusMsg = "Ready"
-		return a, nil, true
+	result := cmd.Execute(cmdCtx, args)
 
-	case "/help":
-		helpText := dimStyle.Render("Available commands:") + "\n" +
-			dimStyle.Render("  /clear        — Clear chat history and reset thread") + "\n" +
-			dimStyle.Render("  /help         — Show this help message") + "\n" +
-			dimStyle.Render("  /history      — List recent saved conversations") + "\n" +
-			dimStyle.Render("  /model [name] — Display or change the current model") + "\n" +
-			dimStyle.Render("  /new          — Start a new conversation thread") + "\n" +
-			dimStyle.Render("  /resume <id>  — Resume a saved conversation") + "\n" +
-			dimStyle.Render("  /tokens       — Show current token usage stats") + "\n" +
-			dimStyle.Render("  /save         — Save the current conversation thread") + "\n" +
-			dimStyle.Render("  /compact [N]  — Compact older messages (keep last N, default 10)") + "\n" +
-			dimStyle.Render("  /quit, /exit  — Quit the application") + "\n\n"
-		a.appendToChat(helpText)
-		return a, nil, true
-
-	case "/model":
-		if len(parts) > 1 {
-			newModel := parts[1]
-			a.modelName = newModel
-			if a.agent != nil {
-				a.agent.SetModel(newModel)
-			}
-			a.appendToChat(dimStyle.Render(fmt.Sprintf("Model changed to: %s", newModel)) + "\n\n")
-			a.statusMsg = fmt.Sprintf("Model: %s", newModel)
-		} else {
-			a.appendToChat(dimStyle.Render(fmt.Sprintf("Current model: %s", a.modelName)) + "\n\n")
-		}
-		return a, nil, true
-
-	case "/tokens":
-		cost := estimateCost(a.modelName, a.totalInputTokens, a.totalOutputTokens)
-		tokenInfo := fmt.Sprintf("Token usage:\n  Input tokens:  %d\n  Output tokens: %d\n  Estimated cost: ~$%.4f",
-			a.totalInputTokens, a.totalOutputTokens, cost)
-		a.appendToChat(dimStyle.Render(tokenInfo) + "\n\n")
-		return a, nil, true
-
-	case "/save":
-		if a.agent == nil {
-			a.appendToChat(errorStyle.Render("Error: agent not initialized.") + "\n\n")
-			return a, nil, true
-		}
-		if a.threadStore == nil {
-			a.appendToChat(errorStyle.Render("Error: thread persistence is not available.") + "\n\n")
-			return a, nil, true
-		}
-		err := a.threadStore.SaveThread(a.agent.Thread())
-		if err != nil {
-			a.appendToChat(errorStyle.Render(fmt.Sprintf("Error saving thread: %v", err)) + "\n\n")
-		} else {
-			threadID := a.agent.Thread().ID
-			msgCount := a.agent.Thread().MessageCount()
-			a.appendToChat(dimStyle.Render(fmt.Sprintf("Thread saved: %s (%d messages)", threadID, msgCount)) + "\n\n")
-		}
-		return a, nil, true
-
-	case "/compact":
-		if a.agent == nil {
-			a.appendToChat(errorStyle.Render("Error: agent not initialized.") + "\n\n")
-			return a, nil, true
-		}
-		keepRecent := 10
-		if len(parts) > 1 {
-			if n, err := strconv.Atoi(parts[1]); err == nil && n > 0 {
-				keepRecent = n
-			}
-		}
-		beforeCount := a.agent.Thread().MessageCount()
-		err := a.agent.CompactMessages(context.Background(), keepRecent)
-		if err != nil {
-			a.appendToChat(errorStyle.Render(fmt.Sprintf("Error compacting: %v", err)) + "\n\n")
-		} else {
-			afterCount := a.agent.Thread().MessageCount()
-			a.appendToChat(dimStyle.Render(fmt.Sprintf("Compacted: %d → %d messages (kept last %d)", beforeCount, afterCount, keepRecent)) + "\n\n")
-		}
-		return a, nil, true
-
-	case "/quit", "/exit":
+	// Handle quit signal.
+	if result.Quit {
 		if a.cancel != nil {
 			a.cancel()
 		}
@@ -533,77 +436,22 @@ func (a *App) handleSlashCommand(input string) (tea.Model, tea.Cmd, bool) {
 			_ = a.threadStore.Close()
 		}
 		return a, tea.Quit, true
+	}
 
-	case "/new":
+	// Handle clear chat signal — reset UI accumulators and token counts.
+	if result.ClearChat {
 		a.chatHistory = ""
 		a.currentResponse = ""
 		a.totalInputTokens = 0
 		a.totalOutputTokens = 0
 		a.totalCost = 0
-		if a.agent != nil {
-			a.agent.ResetThread()
-		}
 		a.viewport.SetContent("")
 		a.viewport.GotoBottom()
-		a.appendToChat(dimStyle.Render("New conversation started.") + "\n\n")
-		a.statusMsg = "Ready"
-		return a, nil, true
+	}
 
-	case "/history":
-		if a.threadStore == nil {
-			a.appendToChat(dimStyle.Render("Thread persistence is not available.") + "\n\n")
-			return a, nil, true
-		}
-		summaries, err := a.threadStore.ListThreads()
-		if err != nil {
-			a.appendToChat(errorStyle.Render(fmt.Sprintf("Error listing threads: %v", err)) + "\n\n")
-			return a, nil, true
-		}
-		if len(summaries) == 0 {
-			a.appendToChat(dimStyle.Render("No saved threads found.") + "\n\n")
-			return a, nil, true
-		}
-		var historyText strings.Builder
-		historyText.WriteString("Recent conversations:\n")
-		limit := 10
-		if len(summaries) < limit {
-			limit = len(summaries)
-		}
-		for i, s := range summaries[:limit] {
-			title := s.Title
-			if len(title) > 60 {
-				title = title[:60] + "…"
-			}
-			fmt.Fprintf(&historyText, "  %d. [%s] %s (%d msgs)\n",
-				i+1, s.ID, title, s.MessageCount)
-		}
-		historyText.WriteString("\nUse /resume <id> to resume a conversation.\n")
-		a.appendToChat(dimStyle.Render(historyText.String()) + "\n")
-		return a, nil, true
-
-	case "/resume":
-		if len(parts) < 2 {
-			a.appendToChat(errorStyle.Render("Usage: /resume <thread-id>") + "\n\n")
-			return a, nil, true
-		}
-		if a.threadStore == nil {
-			a.appendToChat(dimStyle.Render("Thread persistence is not available.") + "\n\n")
-			return a, nil, true
-		}
-		threadID := parts[1]
-		thread, err := a.threadStore.LoadThread(threadID)
-		if err != nil {
-			a.appendToChat(errorStyle.Render(fmt.Sprintf("Error loading thread: %v", err)) + "\n\n")
-			return a, nil, true
-		}
-		if a.agent != nil {
-			a.agent.SetThread(thread)
-		}
-		a.chatHistory = ""
-		a.currentResponse = ""
-		a.viewport.SetContent("")
-		// Replay the conversation history
-		for _, msg := range thread.Messages() {
+	// Handle resumed thread — replay messages in the chat viewport.
+	if result.ResumedThread != nil {
+		for _, msg := range result.ResumedThread.Messages() {
 			switch msg.Role {
 			case llm.RoleUser:
 				a.chatHistory += userStyle.Render("You:") + " " + msg.Content + "\n\n"
@@ -617,15 +465,28 @@ func (a *App) handleSlashCommand(input string) (tea.Model, tea.Cmd, bool) {
 		}
 		a.viewport.SetContent(a.chatHistory)
 		a.viewport.GotoBottom()
-		a.appendToChat(dimStyle.Render(fmt.Sprintf("Resumed thread %s (%d messages)", threadID, thread.MessageCount())) + "\n\n")
-		a.statusMsg = "Ready"
-		return a, nil, true
-
-	default:
-		a.appendToChat(errorStyle.Render(fmt.Sprintf("Unknown command: %s", command)) + "\n")
-		a.appendToChat(dimStyle.Render("Type /help for available commands.") + "\n\n")
-		return a, nil, true
 	}
+
+	// Handle model change.
+	if result.NewModel != "" {
+		a.modelName = result.NewModel
+	}
+
+	// Display output.
+	if result.Output != "" {
+		if result.IsError {
+			a.appendToChat(errorStyle.Render(result.Output) + "\n\n")
+		} else {
+			a.appendToChat(dimStyle.Render(result.Output) + "\n\n")
+		}
+	}
+
+	// Update status bar.
+	if result.StatusMsg != "" {
+		a.statusMsg = result.StatusMsg
+	}
+
+	return a, nil, true
 }
 
 // sendMessage sends the current textarea content to the agent.
@@ -742,7 +603,7 @@ func (a *App) handleAgentEvent(evt agent.Event) (tea.Model, tea.Cmd) {
 		if evt.Usage != nil {
 			a.totalInputTokens += evt.Usage.InputTokens
 			a.totalOutputTokens += evt.Usage.OutputTokens
-			a.totalCost = estimateCost(a.modelName, a.totalInputTokens, a.totalOutputTokens)
+			a.totalCost = commands.EstimateCost(a.modelName, a.totalInputTokens, a.totalOutputTokens)
 			a.statusMsg = fmt.Sprintf("Tokens: %d in / %d out | ~$%.4f", a.totalInputTokens, a.totalOutputTokens, a.totalCost)
 		}
 		return a, waitForEvent(a.eventCh)
